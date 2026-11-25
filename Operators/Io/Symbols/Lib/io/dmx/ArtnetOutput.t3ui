@@ -97,7 +97,7 @@
         "X": -200.0,
         "Y": 150.0
       },
-      "Description": "The IP address of the network interface to send from. A dropdown shows available addresses. If you have multiple network cards, make sure to select the one connected to your lighting network.",
+      "Description": "The IPv4 address to send from. If the saved IP is not available, a local address is chosen if there is there is a unique match for the subnet or the target subnet.",
       "Usage": "CustomDropdown"
     }
   ],

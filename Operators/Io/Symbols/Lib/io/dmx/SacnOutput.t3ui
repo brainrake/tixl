@@ -107,7 +107,7 @@
         "X": -200.0,
         "Y": 150.0
       },
-      "Description": "The IP address of the network interface to send from. A dropdown shows available addresses. If you have multiple network cards, make sure to select the one connected to your lighting network.",
+      "Description": "Source IPv4 address. If the saved IP isn't local, TiXL uses a unique match on its subnet, or on the target subnet if none match. The saved IP stays unchanged.",
       "Usage": "CustomDropdown"
     }
   ],

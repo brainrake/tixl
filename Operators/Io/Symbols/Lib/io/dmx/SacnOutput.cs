@@ -1,6 +1,6 @@
 #nullable enable
 using System.Diagnostics;
-using System.Net.NetworkInformation;
+using Io.Utils;
 using System.Net.Sockets;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -27,7 +27,7 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
     private string? _lastErrorMessage;
     private IStatusProvider.StatusLevel _lastStatusLevel = IStatusProvider.StatusLevel.Notice;
     private readonly byte[] _cid = Guid.NewGuid().ToByteArray();
-    private double _lastNetworkRefreshTime;
+    private readonly LocalAdapterResolver _adapterResolver = new();
     private double _lastRetryTime;
 
     // --- High-Performance Sending Resources ---
@@ -86,20 +86,12 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
     private void Update(EvaluationContext context)
     {
         var localIpString = LocalIpAddress.GetValue(context);
+        var targetIpString = TargetIpAddress.GetValue(context);
+        bool reconnect = Reconnect.GetValue(context);
+        bool adapterChanged = _adapterResolver.Update(localIpString, targetIpString, reconnect);
+        var settingsChanged = _connectionSettings.Update(_adapterResolver.EffectiveAddress, targetIpString, SendUnicast.GetValue(context));
 
-        if (string.IsNullOrEmpty(localIpString) && context.LocalTime - _lastNetworkRefreshTime > 5.0)
-        {
-            _lastNetworkRefreshTime = context.LocalTime;
-            _networkInterfaces = GetNetworkInterfaces();
-        }
-
-        var settingsChanged = _connectionSettings.Update(
-                                                         localIpString,
-                                                         TargetIpAddress.GetValue(context),
-                                                         SendUnicast.GetValue(context)
-                                                        );
-
-        bool needsReconnect = Reconnect.GetValue(context) || settingsChanged;
+        bool needsReconnect = reconnect || settingsChanged || adapterChanged;
         bool shouldAutoRevive = !_connected && _connectionSettings.LocalIp != null && (_lastRetryTime == 0 || context.LocalTime - _lastRetryTime > 2.0);
 
         if (needsReconnect || shouldAutoRevive)
@@ -111,7 +103,7 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
             lock (_connectionLock)
             {
                 CloseSocket();
-                _connected = TryConnectSacn(_connectionSettings.LocalIp);
+                _connected = _adapterResolver.ErrorMessage == null && TryConnectSacn(_connectionSettings.LocalIp);
                 if (shouldAutoRevive) _lastRetryTime = context.LocalTime;
             }
             if (needsThreadRestart) StartSenderThread();
@@ -129,9 +121,15 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
             _wasSendingLastFrame = enableSending;
         }
 
+        if (_adapterResolver.ErrorMessage != null)
+        {
+            SetStatus(_adapterResolver.ErrorMessage, IStatusProvider.StatusLevel.Warning);
+            return;
+        }
+
         if (!enableSending)
         {
-            SetStatus("Sending is disabled. Enable 'Send Trigger'.", IStatusProvider.StatusLevel.Notice);
+            SetStatus(_adapterResolver.DisabledMessage, IStatusProvider.StatusLevel.Notice);
             return;
         }
 
@@ -143,7 +141,7 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
                 return;
             }
         }
-        SetStatus("Connected and sending.", IStatusProvider.StatusLevel.Success);
+        SetStatus(_adapterResolver.SendingMessage, IStatusProvider.StatusLevel.Success);
 
         // --- Calculate Size and Prepare Offload ---
         var inputValueLists = InputsValues.GetCollectedTypedInputs();
@@ -546,24 +544,6 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
         return new IPAddress(new byte[] { 239, 255, (byte)(u >> 8), (byte)(u & 0xFF) });
     }
 
-    private static List<NetworkAdapterInfo> _networkInterfaces = GetNetworkInterfaces();
-
-    private static List<NetworkAdapterInfo> GetNetworkInterfaces()
-    {
-        var list = new List<NetworkAdapterInfo> { new(IPAddress.Loopback, IPAddress.Parse("255.0.0.0"), "Localhost (127.0.0.1)") };
-        try
-        {
-            list.AddRange(from ni in NetworkInterface.GetAllNetworkInterfaces()
-                          where ni.OperationalStatus == OperationalStatus.Up && ni.NetworkInterfaceType != NetworkInterfaceType.Loopback
-                          from ip in ni.GetIPProperties().UnicastAddresses
-                          where ip.Address.AddressFamily == AddressFamily.InterNetwork
-                          select new NetworkAdapterInfo(ip.Address, ip.IPv4Mask, ni.Name));
-        }
-        catch { /* Ignore */ }
-        return list;
-    }
-
-    private sealed record NetworkAdapterInfo(IPAddress IpAddress, IPAddress SubnetMask, string Name) { public string DisplayName => $"{Name}: {IpAddress}"; }
     private struct SacnPacketOptions { public int MaxFps; public byte Priority; public string SourceName; public bool EnableSync; public ushort SyncUniverse; }
 
     private sealed class ConnectionSettings
@@ -571,14 +551,14 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
         public IPAddress? LocalIp { get; private set; }
         public IPAddress? TargetIp { get; private set; }
         public bool SendUnicast { get; private set; }
-        private string? _lastLocalIpStr, _lastTargetIpStr;
+        private string? _lastTargetIpStr;
         private bool _lastSendUnicast;
 
-        public bool Update(string? localIpStr, string? targetIpStr, bool sendUnicast)
+        public bool Update(IPAddress? localIp, string? targetIpStr, bool sendUnicast)
         {
-            if (_lastLocalIpStr == localIpStr && _lastTargetIpStr == targetIpStr && _lastSendUnicast == sendUnicast) return false;
-            _lastLocalIpStr = localIpStr; _lastTargetIpStr = targetIpStr; _lastSendUnicast = sendUnicast; SendUnicast = sendUnicast;
-            IPAddress.TryParse(localIpStr, out var parsedLocalIp); LocalIp = parsedLocalIp;
+            if (Equals(LocalIp, localIp) && _lastTargetIpStr == targetIpStr && _lastSendUnicast == sendUnicast) return false;
+            _lastTargetIpStr = targetIpStr; _lastSendUnicast = sendUnicast; SendUnicast = sendUnicast;
+            LocalIp = localIp;
             IPAddress? targetIp = null;
             if (LocalIp != null && LocalIp.Equals(IPAddress.Loopback)) targetIp = IPAddress.Loopback;
             else if (sendUnicast) IPAddress.TryParse(targetIpStr, out targetIp);
@@ -592,7 +572,7 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
     public void SetStatus(string m, IStatusProvider.StatusLevel l) { _lastErrorMessage = m; _lastStatusLevel = l; }
     string ICustomDropdownHolder.GetValueForInput(Guid inputId)
     {
-        if (inputId == LocalIpAddress.Id) return LocalIpAddress.Value ?? string.Empty;
+        if (inputId == LocalIpAddress.Id) return _adapterResolver.DisplayValue;
         if (inputId == TargetIpAddress.Id) return TargetIpAddress.Value ?? string.Empty;
         return string.Empty;
     }
@@ -601,8 +581,7 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
     {
         if (inputId == LocalIpAddress.Id)
         {
-            _networkInterfaces = GetNetworkInterfaces();
-            foreach (var adapter in _networkInterfaces) yield return adapter.DisplayName;
+            foreach (var option in _adapterResolver.GetOptions()) yield return option;
         }
         else if (inputId == TargetIpAddress.Id)
         {
@@ -617,9 +596,11 @@ internal sealed class SacnOutput : Instance<SacnOutput>, IStatusProvider, ICusto
         if (string.IsNullOrEmpty(selected) || !isAListItem) return;
         if (inputId == LocalIpAddress.Id)
         {
-            var foundAdapter = _networkInterfaces.FirstOrDefault(i => i.DisplayName == selected);
-            if (foundAdapter == null) return;
-            LocalIpAddress.SetTypedInputValue(foundAdapter.IpAddress.ToString());
+            var adapter = _adapterResolver.GetAdapter(selected);
+            if (adapter != null)
+            {
+                LocalIpAddress.SetTypedInputValue(adapter.Address.ToString());
+            }
         }
         else if (inputId == TargetIpAddress.Id)
         {
